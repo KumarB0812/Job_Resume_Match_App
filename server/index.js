@@ -9,7 +9,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const GROQ_KEY = process.env.GROQ_API_KEY;
 
-// Middleware
+// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "20mb" }));
 
 const allowedOrigins = [
@@ -19,15 +19,19 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    if (!origin) return cb(null, true);
+    // Allow exact origins + any Vercel preview deployments for your project
+    const isAllowed = allowedOrigins.includes(origin) ||
+      /https:\/\/job-resume-match.*\.vercel\.app$/.test(origin);
+    if (isAllowed) return cb(null, true);
     cb(new Error(`CORS blocked: ${origin}`));
   },
 }));
 
-// Health check
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
-// GROQ Caller
+// ─── Shared Groq caller ───────────────────────────────────────────────────────
 async function callGroq(prompt, maxTokens = 2000) {
   const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
@@ -52,7 +56,7 @@ async function callGroq(prompt, maxTokens = 2000) {
   return data.choices?.[0]?.message?.content || "";
 }
 
-// Route 1: Extract text from PDF
+// ─── Route 1: Extract text from PDF ──────────────────────────────────────────
 // Groq doesn't support PDFs natively, so we use pdf-parse to extract text
 app.post("/api/extract-pdf", async (req, res) => {
   try {
@@ -88,7 +92,7 @@ app.post("/api/extract-pdf", async (req, res) => {
   }
 });
 
-// Route 2: Analyze resume vs job description
+// ─── Route 2: Analyze resume vs job description ───────────────────────────────
 app.post("/api/analyze", async (req, res) => {
   try {
     const { resumeText, jobDescription } = req.body;
@@ -117,7 +121,7 @@ Respond ONLY with valid JSON, no markdown, no extra text, no code fences:
   }
 });
 
-// Route 3: Tailor resume
+// ─── Route 3: Tailor resume ───────────────────────────────────────────────────
 app.post("/api/tailor", async (req, res) => {
   try {
     const { resumeText, jobDescription } = req.body;
@@ -193,7 +197,7 @@ Only include sections that exist in the original resume. Return empty arrays [] 
   }
 });
 
-// Route 4: Generate ATS PDF from structured JSON
+// ─── Route 4: Generate ATS PDF from structured JSON ──────────────────────────
 app.post("/api/generate-pdf", async (req, res) => {
   try {
     const r = req.body; // structured resume JSON
@@ -215,12 +219,12 @@ app.post("/api/generate-pdf", async (req, res) => {
       doc.moveDown(0.35);
     };
 
-    // Name
+    // ── Name ──
     doc.fontSize(22).font("Helvetica-Bold").fillColor(colors.name)
       .text(r.name, L, doc.y, { align: "center", width: W });
     doc.moveDown(0.2);
 
-    // Contact line
+    // ── Contact line ──
     const contactParts = [r.contact?.email, r.contact?.phone, r.contact?.location, r.contact?.linkedin, r.contact?.website].filter(Boolean);
     doc.fontSize(9).font("Helvetica").fillColor(colors.muted)
       .text(contactParts.join("  |  "), L, doc.y, { align: "center", width: W });
@@ -228,7 +232,7 @@ app.post("/api/generate-pdf", async (req, res) => {
     doc.moveTo(L, doc.y).lineTo(L + W, doc.y).strokeColor("#bbbbbb").lineWidth(0.6).stroke();
     doc.moveDown(0.4);
 
-    // Summary
+    // ── Summary ──
     if (r.summary) {
       sectionHeading("Professional Summary");
       doc.fontSize(9.5).font("Helvetica").fillColor(colors.text)
@@ -236,7 +240,7 @@ app.post("/api/generate-pdf", async (req, res) => {
       doc.moveDown(0.3);
     }
 
-    // Skills
+    // ── Skills ──
     if (r.skills?.length) {
       sectionHeading("Skills");
       const skillLine = r.skills.join("  •  ");
@@ -245,7 +249,7 @@ app.post("/api/generate-pdf", async (req, res) => {
       doc.moveDown(0.3);
     }
 
-    // Experience
+    // ── Experience ──
     if (r.experience?.length) {
       sectionHeading("Experience");
       r.experience.forEach((job) => {
@@ -266,7 +270,7 @@ app.post("/api/generate-pdf", async (req, res) => {
       });
     }
 
-    // Education
+    // ── Education ──
     if (r.education?.length) {
       sectionHeading("Education");
       r.education.forEach((edu) => {
