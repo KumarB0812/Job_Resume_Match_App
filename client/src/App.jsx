@@ -3,7 +3,7 @@ import { useState, useRef, useEffect } from "react";
 const API = process.env.REACT_APP_API_URL || "http://localhost:5000";
 const font = "'Poppins', sans-serif";
 
-// Helpers
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const getScoreColor = (score) => {
   if (score >= 75) return { stroke: "#22c55e", track: "#bbf7d0", bg: "#f0fdf4", text: "#15803d", badge: "#dcfce7" };
   if (score >= 50) return { stroke: "#f59e0b", track: "#fde68a", bg: "#fffbeb", text: "#b45309", badge: "#fef3c7" };
@@ -66,11 +66,13 @@ async function downloadPDF(structured, apiUrl) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(structured),
   });
-  const blob = await res.blob();
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = "ats_resume.pdf";
-  a.click();
+  const data = await res.json();
+  // Open in new tab and trigger print-to-PDF
+  const win = window.open("", "_blank");
+  win.document.write(data.html);
+  win.document.close();
+  win.focus();
+  setTimeout(() => win.print(), 500);
 }
 
 function downloadDoc(structured, filename) {
@@ -86,8 +88,20 @@ function downloadDoc(structured, filename) {
   a.click();
 }
 
+async function downloadPDF(text, apiUrl) {
+  const res = await fetch(`${apiUrl}/api/generate-pdf`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "tailored_resume.pdf";
+  a.click();
+}
 
-// Sub components
+// ─── Sub-components ───────────────────────────────────────────────────────────
 const ScoreCircle = ({ score }) => {
   const [anim, setAnim] = useState(10);
   useEffect(() => { const t = setTimeout(() => setAnim(score), 100); return () => clearTimeout(t); }, [score]);
@@ -194,7 +208,7 @@ const LoadingScreen = ({ steps }) => {
   );
 };
 
-// Main App
+// ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [jd, setJd] = useState("");
   const [pdfText, setPdfText] = useState("");
