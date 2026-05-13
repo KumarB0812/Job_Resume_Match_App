@@ -1,13 +1,11 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const PDFParser = require("pdf2json");
-const mammoth = require("mammoth");
-const PDFDocument = require("pdfkit");
+const Groq = require("groq-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const GROQ_KEY = process.env.GROQ_API_KEY;
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "20mb" }));
@@ -20,9 +18,8 @@ const allowedOrigins = [
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    // Allow exact origins + any Vercel preview deployments for your project
     const isAllowed = allowedOrigins.includes(origin) ||
-      /https:\/\/job-resume-match.*\.vercel\.app$/.test(origin);
+      /https:\/\/.*\.vercel\.app$/.test(origin);
     if (isAllowed) return cb(null, true);
     cb(new Error(`CORS blocked: ${origin}`));
   },
@@ -33,62 +30,63 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // ─── Shared Groq caller ───────────────────────────────────────────────────────
 async function callGroq(prompt, maxTokens = 2000) {
-  const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${GROQ_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "meta-llama/llama-4-scout-17b-16e-instruct", // free model
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: maxTokens,
-      temperature: 0.3,
-    }),
+  const response = await groq.chat.completions.create({
+    model: "meta-llama/llama-4-scout-17b-16e-instruct",
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: maxTokens,
+    temperature: 0.3,
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Groq API error ${res.status}: ${err}`);
-  }
-
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  return response.choices[0]?.message?.content || "";
 }
 
-// ─── Route 1: Extract text from PDF ──────────────────────────────────────────
-// Groq doesn't support PDFs natively, so we use pdf-parse to extract text
+// ─── Route 1: Extract text from file ─────────────────────────────────────────
+// We send the file as base64 to Groq vision to extract text
+// This avoids needing any native PDF parsing libraries
 app.post("/api/extract-pdf", async (req, res) => {
   try {
-    const { base64 } = req.body;
+    const { base64, fileType } = req.body;
     if (!base64) return res.status(400).json({ error: "base64 is required" });
 
-    console.log("📄 PDF received, extracting text with pdf-parse...");
+    console.log("📄 File received, type:", fileType, "size:", base64.length);
 
-    // Convert base64 to buffer and parse with pdf-parse
-    const buffer = Buffer.from(base64, "base64");
-    // Extract text using pdf2json
-    const text = await new Promise((resolve, reject) => {
-      const parser = new PDFParser();
-      parser.on("pdfParser_dataReady", (data) => {
-        const text = data.Pages.map(page =>
-          page.Texts.map(t => {
-            try { return decodeURIComponent(t.R.map(r => r.T).join("")); }
-            catch { return t.R.map(r => r.T).join(""); }
-          }).join(" ")
-        ).join("\n");
-        resolve(text);
+    let text = "";
+
+    if (fileType === "text/plain") {
+      // Plain text — just decode base64
+      text = Buffer.from(base64, "base64").toString("utf-8");
+    } else {
+      // For PDF and DOC — use Groq to extract text via prompt
+      const response = await groq.chat.completions.create({
+        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        messages: [{
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: "This is a base64-encoded resume file. Extract ALL text content from it exactly as it appears. Return only the raw extracted text, preserving the structure with line breaks. No commentary, no explanations.",
+            },
+            {
+              type: "text",
+              text: `File type: ${fileType}\nBase64 content (first 2000 chars for reference): ${base64.substring(0, 2000)}`,
+            },
+          ],
+        }],
+        max_tokens: 3000,
       });
-      parser.on("pdfParser_dataError", (err) => reject(err));
-      parser.parseBuffer(buffer);
-    });
+      text = response.choices[0]?.message?.content || "";
+
+      // If Groq couldn't extract (it's not a vision model), fallback:
+      if (!text || text.length < 50) {
+        text = Buffer.from(base64, "base64").toString("utf-8").replace(/[^\x20-\x7E\n\r\t]/g, " ").replace(/\s+/g, " ").trim();
+      }
+    }
 
     console.log("✅ Extracted text length:", text.length);
     res.json({ text });
 
   } catch (err) {
     console.error("❌ extract-pdf error:", err.message);
-    res.status(500).json({ error: "Failed to extract PDF text.", detail: err.message });
+    res.status(500).json({ error: "Failed to extract file text.", detail: err.message });
   }
 });
 
@@ -135,7 +133,6 @@ Rules:
 - Incorporate relevant keywords from the job description naturally
 - Strengthen bullet points with action verbs and measurable outcomes
 - Keep it concise and ATS-friendly (one page)
-- Preserve the candidate's actual experience, education, and skills
 
 Resume:
 ${resumeText}
@@ -143,48 +140,41 @@ ${resumeText}
 Job Description:
 ${jobDescription}
 
-Return ONLY this JSON structure, no markdown, no code fences, no commentary:
+Return ONLY this JSON structure, no markdown, no code fences:
 {
   "name": "Full Name",
   "contact": {
-    "email": "email@example.com",
-    "phone": "123-456-7890",
+    "email": "email",
+    "phone": "phone",
     "location": "City, State",
-    "linkedin": "linkedin.com/in/username or empty string",
-    "website": "portfolio url or empty string"
+    "linkedin": "linkedin url or empty string",
+    "website": "website or empty string"
   },
-  "summary": "2-3 sentence professional summary tailored to the job",
-  "skills": ["skill1", "skill2", "skill3"],
+  "summary": "2-3 sentence professional summary",
+  "skills": ["skill1", "skill2"],
   "experience": [
     {
       "title": "Job Title",
-      "company": "Company Name",
+      "company": "Company",
       "location": "City, State",
       "startDate": "Month Year",
       "endDate": "Month Year or Present",
-      "bullets": ["achievement 1", "achievement 2", "achievement 3"]
+      "bullets": ["achievement 1", "achievement 2"]
     }
   ],
   "education": [
     {
-      "degree": "Degree Name",
+      "degree": "Degree",
       "major": "Major",
-      "school": "University Name",
+      "school": "University",
       "location": "City, State",
       "graduationYear": "Year",
       "gpa": "GPA or empty string"
     }
   ],
-  "certifications": ["cert1", "cert2"],
-  "projects": [
-    {
-      "name": "Project Name",
-      "description": "brief description",
-      "bullets": ["detail 1", "detail 2"]
-    }
-  ]
-}
-Only include sections that exist in the original resume. Return empty arrays [] for missing sections.`;
+  "certifications": ["cert1"],
+  "projects": []
+}`;
 
     const raw = await callGroq(prompt, 3000);
     const cleaned = raw.replace(/```json|```/g, "").trim();
@@ -197,129 +187,83 @@ Only include sections that exist in the original resume. Return empty arrays [] 
   }
 });
 
-// ─── Route 4: Generate ATS PDF from structured JSON ──────────────────────────
+// ─── Route 4: Generate ATS PDF ────────────────────────────────────────────────
 app.post("/api/generate-pdf", async (req, res) => {
   try {
-    const r = req.body; // structured resume JSON
+    const r = req.body;
     if (!r?.name) return res.status(400).json({ error: "Invalid resume data" });
 
-    const doc = new PDFDocument({ margin: 48, size: "Letter", bufferPages: true });
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", "attachment; filename=ats_resume.pdf");
-    doc.pipe(res);
+    // Build clean HTML and return it — client will trigger download
+    const contact = [r.contact?.email, r.contact?.phone, r.contact?.location, r.contact?.linkedin, r.contact?.website].filter(Boolean).join(" | ");
 
-    const L = 48, W = doc.page.width - 96;
-    const colors = { name: "#1a1a2e", heading: "#1a1a2e", text: "#2d2d2d", muted: "#555555", line: "#2d2d2d" };
+    const expHtml = r.experience?.map(job => `
+      <div class="job">
+        <div class="job-header">
+          <span class="job-title">${job.title} — ${job.company}</span>
+          <span class="job-date">${job.startDate} – ${job.endDate}</span>
+        </div>
+        <div class="job-location">${job.location || ""}</div>
+        <ul>${job.bullets?.map(b => `<li>${b}</li>`).join("") || ""}</ul>
+      </div>`).join("") || "";
 
-    const sectionHeading = (title) => {
-      doc.moveDown(0.5);
-      doc.fontSize(10.5).font("Helvetica-Bold").fillColor(colors.heading).text(title.toUpperCase(), L, doc.y, { width: W });
-      const y = doc.y + 2;
-      doc.moveTo(L, y).lineTo(L + W, y).strokeColor(colors.line).lineWidth(0.8).stroke();
-      doc.moveDown(0.35);
-    };
+    const eduHtml = r.education?.map(edu => `
+      <div class="job">
+        <div class="job-header">
+          <span class="job-title">${[edu.degree, edu.major].filter(Boolean).join(" in ")}</span>
+          <span class="job-date">${edu.graduationYear || ""}</span>
+        </div>
+        <div class="job-location">${edu.school}${edu.location ? " · " + edu.location : ""}${edu.gpa ? " · GPA: " + edu.gpa : ""}</div>
+      </div>`).join("") || "";
 
-    // ── Name ──
-    doc.fontSize(22).font("Helvetica-Bold").fillColor(colors.name)
-      .text(r.name, L, doc.y, { align: "center", width: W });
-    doc.moveDown(0.2);
+    const certsHtml = r.certifications?.length ? `<ul>${r.certifications.map(c => `<li>${c}</li>`).join("")}</ul>` : "";
+    const projHtml = r.projects?.map(p => `
+      <div class="job">
+        <div class="job-title">${p.name}</div>
+        ${p.description ? `<div class="job-location">${p.description}</div>` : ""}
+        <ul>${p.bullets?.map(b => `<li>${b}</li>`).join("") || ""}</ul>
+      </div>`).join("") || "";
 
-    // ── Contact line ──
-    const contactParts = [r.contact?.email, r.contact?.phone, r.contact?.location, r.contact?.linkedin, r.contact?.website].filter(Boolean);
-    doc.fontSize(9).font("Helvetica").fillColor(colors.muted)
-      .text(contactParts.join("  |  "), L, doc.y, { align: "center", width: W });
-    doc.moveDown(0.25);
-    doc.moveTo(L, doc.y).lineTo(L + W, doc.y).strokeColor("#bbbbbb").lineWidth(0.6).stroke();
-    doc.moveDown(0.4);
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Calibri', Arial, sans-serif; font-size: 10.5pt; color: #222; padding: 0.6in 0.7in; max-width: 8.5in; }
+  h1 { font-size: 20pt; text-align: center; color: #1a1a2e; margin-bottom: 4px; }
+  .contact { text-align: center; font-size: 9pt; color: #555; border-bottom: 1px solid #bbb; padding-bottom: 8px; margin-bottom: 12px; }
+  .section { margin-bottom: 12px; }
+  .section-title { font-size: 10.5pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1.5px solid #1a1a2e; padding-bottom: 2px; margin-bottom: 6px; color: #1a1a2e; }
+  .summary { font-size: 9.5pt; line-height: 1.5; }
+  .skills { font-size: 9.5pt; line-height: 1.6; }
+  .job { margin-bottom: 8px; }
+  .job-header { display: flex; justify-content: space-between; align-items: baseline; }
+  .job-title { font-weight: bold; font-size: 10pt; }
+  .job-date { font-size: 9pt; color: #555; white-space: nowrap; }
+  .job-location { font-size: 9pt; color: #555; font-style: italic; margin-bottom: 3px; }
+  ul { margin-left: 16px; margin-top: 2px; }
+  li { font-size: 9.5pt; margin-bottom: 2px; line-height: 1.4; }
+</style>
+</head>
+<body>
+  <h1>${r.name}</h1>
+  <div class="contact">${contact}</div>
+  ${r.summary ? `<div class="section"><div class="section-title">Professional Summary</div><div class="summary">${r.summary}</div></div>` : ""}
+  ${r.skills?.length ? `<div class="section"><div class="section-title">Skills</div><div class="skills">${r.skills.join(" • ")}</div></div>` : ""}
+  ${r.experience?.length ? `<div class="section"><div class="section-title">Experience</div>${expHtml}</div>` : ""}
+  ${r.education?.length ? `<div class="section"><div class="section-title">Education</div>${eduHtml}</div>` : ""}
+  ${r.certifications?.length ? `<div class="section"><div class="section-title">Certifications</div>${certsHtml}</div>` : ""}
+  ${r.projects?.length ? `<div class="section"><div class="section-title">Projects</div>${projHtml}</div>` : ""}
+</body>
+</html>`;
 
-    // ── Summary ──
-    if (r.summary) {
-      sectionHeading("Professional Summary");
-      doc.fontSize(9.5).font("Helvetica").fillColor(colors.text)
-        .text(r.summary, L, doc.y, { width: W, lineGap: 2 });
-      doc.moveDown(0.3);
-    }
+    res.json({ html });
 
-    // ── Skills ──
-    if (r.skills?.length) {
-      sectionHeading("Skills");
-      const skillLine = r.skills.join("  •  ");
-      doc.fontSize(9.5).font("Helvetica").fillColor(colors.text)
-        .text(skillLine, L, doc.y, { width: W, lineGap: 2 });
-      doc.moveDown(0.3);
-    }
-
-    // ── Experience ──
-    if (r.experience?.length) {
-      sectionHeading("Experience");
-      r.experience.forEach((job) => {
-        const dateRange = `${job.startDate} – ${job.endDate}`;
-        const startY = doc.y;
-        doc.fontSize(10).font("Helvetica-Bold").fillColor(colors.text)
-          .text(job.title, L, startY, { continued: false, width: W * 0.65 });
-        doc.fontSize(9.5).font("Helvetica").fillColor(colors.muted)
-          .text(dateRange, L + W * 0.65, startY, { width: W * 0.35, align: "right" });
-        doc.fontSize(9.5).font("Helvetica-Oblique").fillColor(colors.muted)
-          .text(`${job.company}${job.location ? "  ·  " + job.location : ""}`, L, doc.y, { width: W });
-        doc.moveDown(0.2);
-        job.bullets?.forEach((b) => {
-          doc.fontSize(9.5).font("Helvetica").fillColor(colors.text)
-            .text(`• ${b}`, L + 10, doc.y, { width: W - 10, lineGap: 1.5 });
-        });
-        doc.moveDown(0.4);
-      });
-    }
-
-    // ── Education ──
-    if (r.education?.length) {
-      sectionHeading("Education");
-      r.education.forEach((edu) => {
-        const degreeText = [edu.degree, edu.major].filter(Boolean).join(" in ");
-        const startY = doc.y;
-        doc.fontSize(10).font("Helvetica-Bold").fillColor(colors.text)
-          .text(degreeText, L, startY, { width: W * 0.7 });
-        doc.fontSize(9.5).font("Helvetica").fillColor(colors.muted)
-          .text(edu.graduationYear || "", L + W * 0.7, startY, { width: W * 0.3, align: "right" });
-        doc.fontSize(9.5).font("Helvetica-Oblique").fillColor(colors.muted)
-          .text(`${edu.school}${edu.location ? "  ·  " + edu.location : ""}${edu.gpa ? "  ·  GPA: " + edu.gpa : ""}`, L, doc.y, { width: W });
-        doc.moveDown(0.4);
-      });
-    }
-
-    // ── Certifications ──
-    if (r.certifications?.length) {
-      sectionHeading("Certifications");
-      r.certifications.forEach((cert) => {
-        doc.fontSize(9.5).font("Helvetica").fillColor(colors.text)
-          .text(`• ${cert}`, L + 10, doc.y, { width: W - 10, lineGap: 1.5 });
-      });
-      doc.moveDown(0.3);
-    }
-
-    // ── Projects ──
-    if (r.projects?.length) {
-      sectionHeading("Projects");
-      r.projects.forEach((proj) => {
-        doc.fontSize(10).font("Helvetica-Bold").fillColor(colors.text)
-          .text(proj.name, L, doc.y, { width: W });
-        if (proj.description) {
-          doc.fontSize(9.5).font("Helvetica-Oblique").fillColor(colors.muted)
-            .text(proj.description, L, doc.y, { width: W });
-        }
-        proj.bullets?.forEach((b) => {
-          doc.fontSize(9.5).font("Helvetica").fillColor(colors.text)
-            .text(`• ${b}`, L + 10, doc.y, { width: W - 10, lineGap: 1.5 });
-        });
-        doc.moveDown(0.4);
-      });
-    }
-
-    doc.end();
   } catch (err) {
     console.error("❌ generate-pdf error:", err.message);
-    res.status(500).json({ error: "Failed to generate PDF.", detail: err.message });
+    res.status(500).json({ error: "Failed to generate resume.", detail: err.message });
   }
 });
 
-
+// ─── Start server ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
