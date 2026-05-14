@@ -77,7 +77,8 @@ App runs at `http://localhost:3000`.
 
 ## Deploying
 
-I deployed the backend on [Railway](https://railway.app) and the frontend on [Vercel](https://vercel.com) — both have free tiers and take about 10 minutes to set up.
+I deployed the backend on [Railway](https://railway.app) and the frontend on [Vercel](https://vercel.com)
+I bought a custom domain name(www.greybowl.com) for this app and deployed it online.
 
 Just point `REACT_APP_API_URL` to your Railway URL and you're good.
 
